@@ -27,7 +27,7 @@ from unittest.mock import call
 
 import pendulum
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.orm import joinedload
 
 from airflow import settings
@@ -53,6 +53,7 @@ from airflow.serialization.definitions.deadline import SerializedReferenceModels
 from airflow.serialization.serialized_objects import LazyDeserializedDAG
 from airflow.task.trigger_rule import TriggerRule
 from airflow.triggers.base import StartTriggerArgs
+from airflow.utils.session import create_session
 from airflow.utils.span_status import SpanStatus
 from airflow.utils.state import DagRunState, State, TaskInstanceState
 from airflow.utils.thread_safe_dict import ThreadSafeDict
@@ -2261,6 +2262,279 @@ def test_schedule_tis_start_trigger_through_expand(dag_maker, session):
     tis = [(ti.state, ti.map_index) for ti in dr.task_instances]
     assert tis[0] == (TaskInstanceState.DEFERRED, 0)
     assert tis[1] == (None, 1)
+
+
+# ---------------------------------------------------------------------------
+# HA scheduler race-condition regression tests
+# Ref: https://github.com/apache/airflow/issues/59378
+#
+# Root cause: schedule_tis() issued an UPDATE filtered only by TI.id.  In a
+# multi-scheduler cluster, the scheduler's SQLAlchemy session can hold a stale
+# TaskInstance in its identity map (loaded via the joinedload in
+# get_running_dag_runs_to_examine) whose state is still None/UP_FOR_RESCHEDULE.
+# A competing scheduler may have already advanced that TI to QUEUED or RUNNING
+# in the database.  When the stale session later calls schedule_tis(), the
+# unguarded UPDATE overwrites the TI back to SCHEDULED and bumps try_number,
+# causing a 409 heartbeat conflict in the worker and a spurious retry.
+#
+# The fix adds `schedulable_state_clause` to both UPDATE WHERE clauses so that
+# the UPDATE is a no-op when the DB row is already beyond a schedulable state.
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_tis_ha_race_does_not_overwrite_queued_ti(dag_maker, session):
+    """
+    Core HA race-condition test: a stale scheduler must not overwrite a TI
+    that a faster scheduler has already advanced to QUEUED.
+
+    Without the fix the UPDATE has no state guard, rowcount == 1, and
+    try_number is incremented a second time.  With the fix rowcount == 0 and
+    the TI remains QUEUED.
+    """
+    with dag_maker(session=session) as dag:
+        BashOperator(task_id="task", bash_command="echo 1")
+
+    dr = dag_maker.create_dagrun(session=session)
+    ti = dr.get_task_instance("task", session=session)
+    assert ti is not None
+    ti.refresh_from_task(dag.get_task("task"))
+    assert ti.state is None
+    ti.try_number = 0
+    session.flush()
+    session.commit()
+
+    # Faster scheduler wins the race: advances TI to QUEUED (separate session).
+    with create_session() as other_session:
+        filter_clause = TaskInstance.filter_for_tis([ti])
+        assert filter_clause is not None
+        other_session.execute(
+            sa_update(TaskInstance)
+            .where(filter_clause)
+            .values(state=TaskInstanceState.QUEUED, try_number=1)
+            .execution_options(synchronize_session=False)
+        )
+
+    # Stale scheduler still has ti.state == None in memory; schedule_tis must
+    # detect the DB row is no longer schedulable and produce zero updates.
+    assert dr.schedule_tis((ti,), session=session) == 0
+
+    session.expire_all()
+    refreshed = session.scalar(
+        select(TaskInstance).where(
+            TaskInstance.dag_id == ti.dag_id,
+            TaskInstance.task_id == ti.task_id,
+            TaskInstance.run_id == ti.run_id,
+            TaskInstance.map_index == ti.map_index,
+        )
+    )
+    assert refreshed is not None
+    assert refreshed.state == TaskInstanceState.QUEUED
+    assert refreshed.try_number == 1  # NOT incremented a second time
+
+
+def test_schedule_tis_ha_race_does_not_overwrite_running_ti(dag_maker, session):
+    """
+    Same race condition but TI is already RUNNING (worker has started the task).
+
+    This is the most damaging variant: the stale UPDATE sends a live worker's
+    task back to SCHEDULED, which causes a 409 on the next heartbeat and kills
+    the task mid-execution.
+    """
+    with dag_maker(session=session) as dag:
+        BashOperator(task_id="task", bash_command="echo 1")
+
+    dr = dag_maker.create_dagrun(session=session)
+    ti = dr.get_task_instance("task", session=session)
+    assert ti is not None
+    ti.refresh_from_task(dag.get_task("task"))
+    assert ti.state is None
+    ti.try_number = 0
+    session.flush()
+    session.commit()
+
+    # Worker has started; TI is RUNNING in DB.
+    with create_session() as other_session:
+        filter_clause = TaskInstance.filter_for_tis([ti])
+        assert filter_clause is not None
+        other_session.execute(
+            sa_update(TaskInstance)
+            .where(filter_clause)
+            .values(state=TaskInstanceState.RUNNING, try_number=1)
+            .execution_options(synchronize_session=False)
+        )
+
+    assert dr.schedule_tis((ti,), session=session) == 0
+
+    session.expire_all()
+    refreshed = session.scalar(
+        select(TaskInstance).where(
+            TaskInstance.dag_id == ti.dag_id,
+            TaskInstance.task_id == ti.task_id,
+            TaskInstance.run_id == ti.run_id,
+            TaskInstance.map_index == ti.map_index,
+        )
+    )
+    assert refreshed is not None
+    assert refreshed.state == TaskInstanceState.RUNNING
+    assert refreshed.try_number == 1
+
+
+def test_schedule_tis_ha_race_empty_operator_does_not_overwrite_queued_ti(dag_maker, session):
+    """
+    Same race condition on the EmptyOperator fast-path.
+
+    EmptyOperator TIs are short-circuited to SUCCESS without going through a
+    worker.  The fast-path UPDATE also lacked the state guard, so a stale
+    scheduler could re-set an already-QUEUED empty-operator TI.
+    """
+    with dag_maker(session=session) as dag:
+        EmptyOperator(task_id="empty_task")
+
+    dr = dag_maker.create_dagrun(session=session)
+    ti = dr.get_task_instance("empty_task", session=session)
+    assert ti is not None
+    ti.refresh_from_task(dag.get_task("empty_task"))
+    assert ti.state is None
+    ti.try_number = 0
+    session.flush()
+    session.commit()
+
+    with create_session() as other_session:
+        filter_clause = TaskInstance.filter_for_tis([ti])
+        assert filter_clause is not None
+        other_session.execute(
+            sa_update(TaskInstance)
+            .where(filter_clause)
+            .values(state=TaskInstanceState.QUEUED, try_number=1)
+            .execution_options(synchronize_session=False)
+        )
+
+    assert dr.schedule_tis((ti,), session=session) == 0
+
+    session.expire_all()
+    refreshed = session.scalar(
+        select(TaskInstance).where(
+            TaskInstance.dag_id == ti.dag_id,
+            TaskInstance.task_id == ti.task_id,
+            TaskInstance.run_id == ti.run_id,
+            TaskInstance.map_index == ti.map_index,
+        )
+    )
+    assert refreshed is not None
+    assert refreshed.state == TaskInstanceState.QUEUED
+    assert refreshed.try_number == 1
+
+
+def test_schedule_tis_ha_race_up_for_reschedule_does_not_increment_try_number(dag_maker, session):
+    """
+    UP_FOR_RESCHEDULE TIs (e.g. sensors in reschedule mode) must not have
+    their try_number incremented when schedule_tis() transitions them to
+    SCHEDULED.  The same try_number is reused across reschedule cycles so
+    that the task's history stays readable.
+    """
+    with dag_maker(session=session) as dag:
+        BashOperator(task_id="task", bash_command="echo 1")
+
+    dr = dag_maker.create_dagrun(session=session)
+    ti = dr.get_task_instance("task", session=session)
+    assert ti is not None
+    ti.refresh_from_task(dag.get_task("task"))
+    ti.state = TaskInstanceState.UP_FOR_RESCHEDULE
+    ti.try_number = 3
+    session.commit()
+
+    assert dr.schedule_tis((ti,), session=session) == 1
+    session.commit()
+
+    session.expire_all()
+    refreshed = session.scalar(
+        select(TaskInstance).where(
+            TaskInstance.dag_id == ti.dag_id,
+            TaskInstance.task_id == ti.task_id,
+            TaskInstance.run_id == ti.run_id,
+            TaskInstance.map_index == ti.map_index,
+        )
+    )
+    assert refreshed is not None
+    assert refreshed.state == TaskInstanceState.SCHEDULED
+    assert refreshed.try_number == 3  # not incremented — same reschedule cycle
+
+
+def test_schedule_tis_ha_race_stale_identity_map_simulation(dag_maker, session):
+    """
+    Reproduces the exact production failure path.
+
+    In the real scheduler, get_running_dag_runs_to_examine() uses
+    joinedload(DagRun.task_instances), which populates the SQLAlchemy session
+    identity map with TI objects.  A competing scheduler (or a previous
+    scheduling iteration) then advances those TIs to QUEUED/RUNNING in the DB.
+    When the stale scheduler reaches schedule_tis(), it passes the identity-map
+    TIs (still showing state=None) to the UPDATE.
+
+    This test replicates that scenario step-by-step:
+      1. Create DagRun + TI, commit.
+      2. Re-load the DagRun *with joinedload* (mimicking the scheduler query),
+         which puts TI(state=None) in the identity map.
+      3. In a separate session, advance TI to RUNNING.
+      4. Call schedule_tis() with the identity-map TI (still state=None).
+      5. Assert the UPDATE is a no-op and TI remains RUNNING.
+    """
+    with dag_maker(session=session) as dag:
+        BashOperator(task_id="task", bash_command="echo 1")
+
+    dag_maker.create_dagrun(session=session)
+    session.commit()
+
+    # Expire so the subsequent select actually hits the DB.
+    session.expire_all()
+
+    # Step 2: mimic get_running_dag_runs_to_examine — load with joinedload.
+    loaded_dr = session.scalar(
+        select(DagRun)
+        .options(joinedload(DagRun.task_instances))
+        .where(DagRun.dag_id == dag.dag_id)
+        .order_by(DagRun.id.desc())
+        .limit(1)
+    )
+    assert loaded_dr is not None
+
+    stale_ti = next(
+        (ti for ti in loaded_dr.task_instances if ti.task_id == "task"),
+        None,
+    )
+    assert stale_ti is not None
+    stale_ti.refresh_from_task(dag.get_task("task"))
+    assert stale_ti.state is None  # identity-map copy: still None
+
+    # Step 3: competing scheduler advances TI to RUNNING in a separate session.
+    with create_session() as other_session:
+        filter_clause = TaskInstance.filter_for_tis([stale_ti])
+        assert filter_clause is not None
+        other_session.execute(
+            sa_update(TaskInstance)
+            .where(filter_clause)
+            .values(state=TaskInstanceState.RUNNING, try_number=1)
+            .execution_options(synchronize_session=False)
+        )
+
+    # Step 4: stale scheduler calls schedule_tis with the identity-map TI.
+    # With the fix the UPDATE WHERE clause includes the state guard, so the
+    # DB row (now RUNNING) does not match and rowcount == 0.
+    assert loaded_dr.schedule_tis((stale_ti,), session=session) == 0
+
+    # Step 5: verify DB row is still RUNNING with the correct try_number.
+    session.expire_all()
+    refreshed = session.scalar(
+        select(TaskInstance).where(
+            TaskInstance.dag_id == stale_ti.dag_id,
+            TaskInstance.task_id == stale_ti.task_id,
+            TaskInstance.run_id == stale_ti.run_id,
+            TaskInstance.map_index == stale_ti.map_index,
+        )
+    )
+    assert refreshed is not None
+    assert refreshed.state == TaskInstanceState.RUNNING
+    assert refreshed.try_number == 1  # the worker's try, not overwritten
 
 
 def test_mapped_expand_kwargs(dag_maker):

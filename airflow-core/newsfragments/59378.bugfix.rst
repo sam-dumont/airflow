@@ -1,0 +1,1 @@
+Fix HA scheduler race condition in ``schedule_tis()`` where a stale scheduler could overwrite a ``QUEUED`` or ``RUNNING`` task back to ``SCHEDULED``, causing spurious retries and ``409 Conflict`` heartbeat failures in multi-scheduler deployments.
