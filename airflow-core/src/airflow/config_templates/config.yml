@@ -2347,6 +2347,15 @@ scheduler:
       type: integer
       example: ~
       default: "0"
+    dag_bag_cache_size:
+      description: |
+        Maximum number of serialized DAG versions to keep in the scheduler's
+        in-memory cache. Old entries are evicted in LRU order. Set to 0 to
+        disable eviction (unbounded, previous behavior).
+      version_added: 3.2.0
+      type: integer
+      example: ~
+      default: "0"
     num_runs:
       description: |
         The number of times to try to schedule each DAG file

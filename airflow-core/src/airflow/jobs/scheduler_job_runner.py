@@ -295,7 +295,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         if log:
             self._log = log
 
-        self.scheduler_dag_bag = DBDagBag(load_op_links=False)
+        dag_bag_cache_size = conf.getint("scheduler", "dag_bag_cache_size", fallback=0)
+        self.scheduler_dag_bag = DBDagBag(load_op_links=False, max_cache_size=dag_bag_cache_size)
 
     @provide_session
     def heartbeat_callback(self, session: Session = NEW_SESSION) -> None:

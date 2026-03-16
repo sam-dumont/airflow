@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -44,18 +45,28 @@ class DBDagBag:
     :meta private:
     """
 
-    def __init__(self, load_op_links: bool = True) -> None:
-        self._dags: dict[UUID, SerializedDAG] = {}  # dag_version_id to dag
+    def __init__(self, load_op_links: bool = True, max_cache_size: int = 0) -> None:
+        self._dags: OrderedDict[UUID, SerializedDAG] = OrderedDict()
         self.load_op_links = load_op_links
+        self._max_cache_size = max_cache_size
 
     def _read_dag(self, serdag: SerializedDagModel) -> SerializedDAG | None:
         serdag.load_op_links = self.load_op_links
         if dag := serdag.dag:
             self._dags[serdag.dag_version_id] = dag
+            self._dags.move_to_end(serdag.dag_version_id)
+            self._evict_if_needed()
         return dag
+
+    def _evict_if_needed(self) -> None:
+        if self._max_cache_size <= 0:
+            return
+        while len(self._dags) > self._max_cache_size:
+            self._dags.popitem(last=False)
 
     def _get_dag(self, version_id: UUID, session: Session) -> SerializedDAG | None:
         if dag := self._dags.get(version_id):
+            self._dags.move_to_end(version_id)
             return dag
         dag_version = session.get(DagVersion, version_id, options=[joinedload(DagVersion.serialized_dag)])
         if not dag_version:
